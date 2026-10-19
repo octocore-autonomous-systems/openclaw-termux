@@ -1,0 +1,1047 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# openclaw-patch-android — inject Termux/runit support into the OpenClaw dist
+#
+# Content-addressed: walks dist/ (*.js and *.mjs) for stable code anchors, never
+# hash-stamped filenames. Each patch (service adapter, dashboard --no-open,
+# fs-safe link compatibility) is checked and applied independently, so an
+# already-applied service patch never hides a missing dashboard patch.
+#
+# fs-safe compatibility: Android's app SELinux policy denies link(2) with
+# EACCES, which breaks fs-safe's no-replace publication (config reads fail with
+# "SQLite read-only worker failed while creating its private snapshot"). The
+# patch renames after fs-safe's own target-absent check on Android and adds
+# EACCES to the two upstream link-fallback code lists.
+#
+# fs-safe native: fs-safe ships no Android addon, so its native no-replace
+# rename (renameat2) is unavailable and it falls back to link(2). The patcher
+# fetches the matching @openclaw/fs-safe-linux-arm64-musl prebuild, relinks it
+# for Bionic with patchelf (a small compiled shim supplies __errno_location,
+# __xpg_strerror_r, bcmp and musl-numbered sysconf), smoke-tests renameNoReplace,
+# installs it next to fs-safe, and maps android/arm64 to that target in every
+# copy of the loader. Needs npm, patchelf and clang (pkg install patchelf clang).
+#
+# proc: getProcessStartTime() reads /proc/<pid>/stat only on "linux"; Android
+# has the same /proc, and without it update-run and lock owners have no identity.
+#
+# migrate: session-SQLite migration archives verified JSONL originals by a
+# link-then-unlink two-name publication, which Android cannot do; on Android
+# the archive move becomes an exclusive rename with the same identity checks.
+#
+# birth: SQLite file identity includes birthtime off Linux; Android's
+# filesystem reports none (Node substitutes ctime), so every write looked like
+# a replaced database ("Existing shared-state database generation changed").
+#
+# owner: fs-safe trusts temp-root ancestors owned by the user or root; on
+# Android /data and /data/data belong to the platform's system uid (1000).
+#
+# ancestor: temp/SQLite staging ancestors may be group-writable on Android
+# (0771 app dirs) when the group is the app's own gid or system; world-writable
+# ancestors and private leaf directories are still refused.
+#
+# lifecycle: `openclaw gateway restart` restarts through runit (sv restart) on
+# Android instead of signalling a "foreground" owner it cannot verify.
+#
+# Fail-closed: an absent or repeated anchor aborts before anything is written.
+# Atomic: each file is written to a temporary sibling, syntax-checked with
+# `node --check`, and only then renamed over the original.
+# Idempotent: a second run reports "already applied" and changes nothing.
+# Backup-aware: the pristine file is copied to the backup dir before the first
+# mutation (default: ~/.cache/openclaw-patch-android/backups/<version>/).
+#
+# The runit adapter never rewrites an existing service. stage/install validate
+# and preserve $PREFIX/var/service/openclaw-gateway (customized run script with
+# HOME, gateway-env.sh and LD_PRELOAD); only a genuinely absent service is
+# created, with the same environment behaviour.
+#
+# Usage:
+#   openclaw-patch-android                 # apply missing patches
+#   openclaw-patch-android --check         # exit 0 = all applied, 1 = needed, 2 = error
+#   openclaw-patch-android --dist PATH     # operate on a staged dist/ tree (testing)
+#   openclaw-patch-android --backup-dir D  # override the backup location
+#
+# Called automatically by openclaw-update after each npm install.
+set -euo pipefail
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+DIST="${PREFIX}/lib/node_modules/openclaw/dist"
+CHECK_ONLY=0
+BACKUP_DIR=""
+
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
+
+while (($#)); do
+    case "$1" in
+        --check) CHECK_ONLY=1 ;;
+        --dist) DIST="${2:?--dist needs a path}"; shift ;;
+        --backup-dir) BACKUP_DIR="${2:?--backup-dir needs a path}"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERROR: unknown argument: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+if [[ ! -d "$DIST" ]]; then
+    echo "ERROR: OpenClaw dist not found at $DIST" >&2
+    exit 2
+fi
+
+exec python3 -I - "$DIST" "$CHECK_ONLY" "$BACKUP_DIR" "$PREFIX" << 'PYEOF'
+import os, re, shutil, subprocess, sys, json
+
+dist = os.path.realpath(sys.argv[1])
+check_only = sys.argv[2] == "1"
+backup_dir_arg = sys.argv[3]
+prefix = sys.argv[4]
+
+PATCH_ID = "openclaw-patch-android:runit v2"
+REGISTRY_DECL = "const GATEWAY_SERVICE_REGISTRY = {"
+SERVICE_REGION = "//#region src/daemon/service.ts\n"
+DASH_ANCHOR = "if (!options.noOpen) {"
+DASH_LINE = 'if (process.env.TERMUX_VERSION || process.platform === "android") options.noOpen = true;'
+DASH_DETECT = re.compile(r'TERMUX_VERSION[^\n]*process\.platform === "android"[^\n]*options\.noOpen = true')
+SPAWN_IMPORT = 'import { spawnSync as _ocAndroidSpawnSync } from "node:child_process";\n'
+# fs-safe publishes no-replace files with link(2), which Android's app SELinux
+# policy denies with EACCES (upstream only falls back on EPERM/EXDEV/ENOTSUP).
+FSSAFE_ID = "openclaw-patch-android:fs-safe-link v1"
+FSSAFE_LINK_RE = re.compile(r"^([ \t]*)fs\.linkSync\(temporaryPath, targetPath\);[ \t]*$", re.M)
+FSSAFE_LINK_FALLBACK = (
+    "try { fs.linkSync(temporaryPath, targetPath); } catch (_ocAndroidLinkError) {"
+    ' if (process.platform !== "android" || !["EACCES", "EPERM"].includes(_ocAndroidLinkError?.code)'
+    " || fs.lstatSync(targetPath, { throwIfNoEntry: false })) throw _ocAndroidLinkError;"
+    " fs.renameSync(temporaryPath, targetPath); params.onPublished?.(identity); return; }"
+    f" /* {FSSAFE_ID} */"
+)
+FSSAFE_SET_OLD = 'const HARDLINK_FALLBACK_CODES = new Set(["EPERM",'
+FSSAFE_SET_NEW = 'const HARDLINK_FALLBACK_CODES = new Set(["EACCES", "EPERM",'
+# Native clone (FICLONE) is denied the same way; let it fall back to a plain copy.
+FSSAFE_COPY_OLD = 'const NATIVE_COPY_FALLBACK_CODES = new Set(["EINVAL",'
+FSSAFE_COPY_NEW = 'const NATIVE_COPY_FALLBACK_CODES = new Set(["EACCES", "EINVAL",'
+# The native addon's FICLONE is denied too; retry the native copy without cloning.
+FSSAFE_CLONE_ID = "openclaw-patch-android:fs-safe-clone v1"
+FSSAFE_CLONE_RE = re.compile(r'^([ \t]*)if \(code === "ENOTSUP" && input\.clone !== "always"\)', re.M)
+FSSAFE_CLONE_LINE = ('if (process.platform === "android" && code === "EACCES" && input.clone !== "always"'
+                     ' && /FICLONE/.test(String(error?.message))) return await native.copyFileExclusive(input.handle.fd,'
+                     ' parentFd, basename, "never", maxBytes !== void 0 && Number.isFinite(maxBytes) ? maxBytes : void 0,'
+                     f' nativeSignal); /* {FSSAFE_CLONE_ID} */')
+FSSAFE_NORM_RE = re.compile(r'(code === "EOPNOTSUPP" \|\|\s*code === "EPERM")\)')
+FSSAFE_NORM_DONE_RE = re.compile(r'code === "EOPNOTSUPP" \|\|\s*code === "EPERM" \|\| code === "EACCES"\)')
+FS_IMPORT_RE = re.compile(r'^import fs from "node:fs";$', re.M)
+LEGACY_MARKERS = ("_runSv(", "_stageRunitService", "injected by openclaw-patch-android) ──")
+
+
+class PatchError(Exception):
+    pass
+
+
+def fail(msg):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+# ── discovery ────────────────────────────────────────────────────────────────
+def walk_dist():
+    for root, dirs, files in os.walk(dist):
+        rel = os.path.relpath(root, dist)
+        parts = [] if rel == "." else rel.split(os.sep)
+        # Extension bundles and nested dependency trees are not the core CLI.
+        dirs[:] = [d for d in dirs if d not in ("node_modules", "extensions")]
+        if "node_modules" in parts or "extensions" in parts:
+            continue
+        for name in files:
+            if name.endswith((".js", ".mjs")) and ".ocpatch-tmp" not in name:
+                path = os.path.join(root, name)
+                if os.path.isfile(path) and not os.path.islink(path):
+                    yield path
+
+
+def read(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def discover():
+    svc, dash = [], []
+    for path in walk_dist():
+        try:
+            text = read(path)
+        except (UnicodeDecodeError, OSError):
+            continue
+        if REGISTRY_DECL in text:
+            svc.append(path)
+        if DASH_ANCHOR in text or DASH_DETECT.search(text):
+            dash.append(path)
+    return svc, dash
+
+
+def fssafe_roots():
+    """Core dist plus the package's own fs-safe copy (bundles inline parts of it)."""
+    yield from walk_dist()
+    lib = os.path.join(os.path.dirname(dist), "node_modules", "@openclaw", "fs-safe", "dist")
+    for root, _dirs, files in os.walk(lib):
+        for name in files:
+            if name.endswith((".js", ".mjs")) and ".ocpatch-tmp" not in name:
+                yield os.path.join(root, name)
+
+
+def discover_fssafe():
+    found = []
+    for path in fssafe_roots():
+        try:
+            text = read(path)
+        except (UnicodeDecodeError, OSError):
+            continue
+        if (FSSAFE_ID in text or FSSAFE_LINK_RE.search(text) or FSSAFE_SET_OLD in text or FSSAFE_COPY_OLD in text
+                or FSSAFE_CLONE_ID in text or FSSAFE_CLONE_RE.search(text)
+                or FSSAFE_SET_NEW in text or FSSAFE_NORM_RE.search(text) or FSSAFE_NORM_DONE_RE.search(text)):
+            found.append(path)
+    if not any(FSSAFE_LINK_RE.search(read(p)) or FSSAFE_ID in read(p) for p in found):
+        raise PatchError("fs-safe publishCopyStage link anchor not found")
+    return found
+
+
+def fssafe_state(text):
+    pending = []
+    link = len(FSSAFE_LINK_RE.findall(text))
+    if link > 1:
+        raise PatchError(f"fs-safe link anchor occurs {link} times")
+    if link == 1 and FSSAFE_ID not in text:
+        pending.append("link")
+    if FSSAFE_SET_OLD in text:
+        if text.count(FSSAFE_SET_OLD) != 1:
+            raise PatchError("HARDLINK_FALLBACK_CODES occurs more than once")
+        pending.append("codes")
+    if FSSAFE_COPY_OLD in text:
+        if text.count(FSSAFE_COPY_OLD) != 1:
+            raise PatchError("NATIVE_COPY_FALLBACK_CODES occurs more than once")
+        pending.append("copy-codes")
+    clone = len(FSSAFE_CLONE_RE.findall(text))
+    if clone > 1:
+        raise PatchError(f"native copy ENOTSUP anchor occurs {clone} times")
+    if clone == 1 and FSSAFE_CLONE_ID not in text:
+        pending.append("clone")
+    norm = len(FSSAFE_NORM_RE.findall(text))
+    if norm > 1:
+        raise PatchError(f"normalizeLinkError anchor occurs {norm} times")
+    if norm == 1:
+        pending.append("normalize")
+    return "needed" if pending else "applied"
+
+
+def patch_fssafe(text):
+    text = FSSAFE_LINK_RE.sub(lambda m: m.group(1) + FSSAFE_LINK_FALLBACK, text, count=1)
+    text = text.replace(FSSAFE_SET_OLD, FSSAFE_SET_NEW, 1)
+    text = text.replace(FSSAFE_COPY_OLD, FSSAFE_COPY_NEW, 1)
+    if FSSAFE_CLONE_ID not in text:
+        text = FSSAFE_CLONE_RE.sub(lambda m: m.group(1) + FSSAFE_CLONE_LINE + "\n" + m.group(0), text, count=1)
+    text = FSSAFE_NORM_RE.sub(r'\1 || code === "EACCES")', text, count=1)
+    if fssafe_state(text) != "applied":
+        raise PatchError("fs-safe post-patch verification failed")
+    return text
+
+
+# ── fs-safe native addon (musl prebuild relinked for Bionic) ─────────────────
+NATIVE_ID = "openclaw-patch-android:fs-safe-native v1"
+NATIVE_PKG = "@openclaw/fs-safe-linux-arm64-musl"
+NATIVE_MARKER = ".openclaw-patch-android.json"
+LOADER_RE = re.compile(r"\(process\.platform,(\s*)process\.arch,(\s*)isMusl\(\)\)")
+LOADER_NEW = ('(process.platform === "android" ? "linux" : process.platform,\\1process.arch,'
+              '\\2process.platform === "android" || isMusl()) /* ' + NATIVE_ID + ' */')
+SHIM_SOURCE = r"""/* Bionic shims for the linux-arm64-musl fs-safe native addon (openclaw-patch-android). */
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+
+int *ocmusl_errno_location(void) { return &errno; }
+
+/* Bionic's strerror_r is the XSI (int) form that musl exports as __xpg_strerror_r. */
+int ocmusl_xpg_strerror_r(int err, char *buf, size_t len) { return strerror_r(err, buf, len); }
+
+int ocmusl_bcmp(const void *a, const void *b, size_t n) { return memcmp(a, b, n); }
+
+/* musl and Bionic number the _SC_* names differently; translate musl's numbers. */
+long ocmusl_sysconf(int name) {
+	switch (name) {
+	case 0: return sysconf(_SC_ARG_MAX);
+	case 1: return sysconf(_SC_CHILD_MAX);
+	case 2: return sysconf(_SC_CLK_TCK);
+	case 3: return sysconf(_SC_NGROUPS_MAX);
+	case 4: return sysconf(_SC_OPEN_MAX);
+	case 30: return sysconf(_SC_PAGESIZE);
+	case 69: return sysconf(_SC_GETGR_R_SIZE_MAX);
+	case 70: return sysconf(_SC_GETPW_R_SIZE_MAX);
+	case 75: return sysconf(_SC_THREAD_STACK_MIN);
+	case 83: return sysconf(_SC_NPROCESSORS_CONF);
+	case 84: return sysconf(_SC_NPROCESSORS_ONLN);
+	case 85: return sysconf(_SC_PHYS_PAGES);
+	case 86: return sysconf(_SC_AVPHYS_PAGES);
+	default: errno = EINVAL; return -1;
+	}
+}
+"""
+SHIM_NAME = "libfs_safe_bionic_shim.so"
+WRAPPER_NAME = "android-binding.cjs"
+WRAPPER_SOURCE = """"use strict";
+// openclaw-patch-android: Android app sandboxes deny FICLONE (and Android filesystems
+// cannot reflink), so "auto" cloning means a plain native copy; "always" still fails.
+const binding = require("./fs-safe-native.node");
+const wrapped = Object.assign({}, binding);
+for (const name of ["copyFileExclusive", "copyFileExclusiveSync"]) {
+\tif (typeof binding[name] !== "function") continue;
+\twrapped[name] = function (sourceFd, parentFd, basename, clone, ...rest) {
+\t\treturn binding[name](sourceFd, parentFd, basename, clone === "auto" ? "never" : clone, ...rest);
+\t};
+}
+module.exports = wrapped;
+"""
+SYMBOL_RENAMES = (
+    ("__errno_location", "ocmusl_errno_location"),
+    ("__xpg_strerror_r", "ocmusl_xpg_strerror_r"),
+    ("bcmp", "ocmusl_bcmp"),
+    ("sysconf", "ocmusl_sysconf"),
+)
+NATIVE_SMOKE = r"""
+const fs = require("fs"); const path = require("path");
+const b = require(process.argv[1]); const d = process.argv[2];
+fs.writeFileSync(path.join(d, "a"), "A"); fs.writeFileSync(path.join(d, "c"), "C");
+const fd = fs.openSync(d, "r");
+b.renameNoReplace(fd, "a", fd, "b");
+if (fs.existsSync(path.join(d, "a")) || fs.readFileSync(path.join(d, "b"), "utf8") !== "A") throw new Error("rename result wrong");
+let refused = false;
+try { b.renameNoReplace(fd, "c", fd, "b"); } catch (e) { refused = e.code === "EEXIST"; }
+if (!refused || fs.readFileSync(path.join(d, "b"), "utf8") !== "A") throw new Error("no-replace not enforced");
+if (typeof b.closeOwnedFd !== "function") throw new Error("closeOwnedFd missing");
+console.log("ok");
+"""
+
+
+def pkg_root():
+    return os.path.dirname(dist)
+
+
+def fssafe_version():
+    try:
+        with open(os.path.join(pkg_root(), "node_modules", "@openclaw", "fs-safe", "package.json"), encoding="utf-8") as f:
+            return json.load(f)["version"]
+    except (OSError, ValueError, KeyError):
+        raise PatchError("cannot read the bundled @openclaw/fs-safe version")
+
+
+def sha256(path):
+    import hashlib
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def native_dir():
+    return os.path.join(pkg_root(), "node_modules", *NATIVE_PKG.split("/"))
+
+
+def native_state():
+    version = fssafe_version()
+    marker = os.path.join(native_dir(), NATIVE_MARKER)
+    try:
+        with open(marker, encoding="utf-8") as f:
+            meta = json.load(f)
+        ok = (meta.get("fsSafeVersion") == version
+              and sha256(os.path.join(native_dir(), "fs-safe-native.node")) == meta.get("nodeSha256")
+              and sha256(os.path.join(native_dir(), SHIM_NAME)) == meta.get("shimSha256")
+              and os.path.exists(os.path.join(native_dir(), WRAPPER_NAME))
+              and sha256(os.path.join(native_dir(), WRAPPER_NAME)) == meta.get("wrapperSha256")
+              and meta.get("wrapperSha256") == __import__("hashlib").sha256(WRAPPER_SOURCE.encode()).hexdigest())
+        return "applied" if ok else "needed"
+    except (OSError, ValueError):
+        return "needed"
+
+
+def run(cmd, **kw):
+    r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    if r.returncode != 0:
+        raise PatchError(f"{' '.join(cmd[:3])} failed: {(r.stderr or r.stdout).strip()[-800:]}")
+    return r.stdout
+
+
+def build_native():
+    """Build the relinked addon package in a temporary sibling; return its path."""
+    import tarfile, tempfile
+    for tool in ("npm", "patchelf", "clang", "node"):
+        if not shutil.which(tool):
+            raise PatchError(f"{tool} is required to build the fs-safe native addon")
+    version = fssafe_version()
+    cache = os.path.join(os.path.expanduser("~"), ".cache", "openclaw-patch-android", "native", version)
+    os.makedirs(cache, mode=0o700, exist_ok=True)
+    tgz = os.path.join(cache, f"openclaw-fs-safe-linux-arm64-musl-{version}.tgz")
+    if not os.path.exists(tgz):
+        run(["npm", "pack", f"{NATIVE_PKG}@{version}", "--pack-destination", cache, "--silent"])
+    parent = os.path.dirname(native_dir())
+    os.makedirs(parent, exist_ok=True)
+    stage = tempfile.mkdtemp(prefix=".fs-safe-native.ocpatch-tmp-", dir=parent)
+    try:
+        with tarfile.open(tgz) as tar:
+            members = [m for m in tar.getmembers() if m.name.startswith("package/")]
+            tar.extractall(stage, members=members, filter="data")
+        pkg = os.path.join(stage, "package")
+        node_file = os.path.join(pkg, "fs-safe-native.node")
+        if not os.path.isfile(node_file):
+            raise PatchError("musl prebuild does not contain fs-safe-native.node")
+        src = os.path.join(stage, "shim.c")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write(SHIM_SOURCE)
+        run(["clang", "-O2", "-fPIC", "-shared", f"-Wl,-soname,{SHIM_NAME}", "-o", os.path.join(pkg, SHIM_NAME), src])
+        renames = os.path.join(stage, "rename.map")
+        with open(renames, "w", encoding="utf-8") as f:
+            f.write("".join(f"{a} {b}\n" for a, b in SYMBOL_RENAMES))
+        run(["patchelf", "--rename-dynamic-symbols", renames, "--add-needed", SHIM_NAME,
+             "--set-rpath", "$ORIGIN", node_file])
+        smoke = tempfile.mkdtemp(dir=stage)
+        out = run(["node", "-e", NATIVE_SMOKE, node_file, smoke])
+        if out.strip() != "ok":
+            raise PatchError("relinked fs-safe addon failed its smoke test")
+        shutil.rmtree(smoke)
+        with open(os.path.join(pkg, WRAPPER_NAME), "w", encoding="utf-8") as f:
+            f.write(WRAPPER_SOURCE)
+        manifest_path = os.path.join(pkg, "package.json")
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+        manifest["main"] = WRAPPER_NAME
+        manifest["files"] = sorted(set(manifest.get("files", [])) | {WRAPPER_NAME, SHIM_NAME, NATIVE_MARKER})
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+            f.write("\n")
+        out = run(["node", "-e", "const b = require(process.argv[1]); if (typeof b.closeOwnedFd !== 'function') process.exit(1); console.log('ok')", pkg])
+        if out.strip() != "ok":
+            raise PatchError("wrapped fs-safe addon failed to load")
+        with open(os.path.join(pkg, NATIVE_MARKER), "w", encoding="utf-8") as f:
+            json.dump({"patch": NATIVE_ID, "fsSafeVersion": version,
+                       "nodeSha256": sha256(node_file), "shimSha256": sha256(os.path.join(pkg, SHIM_NAME)),
+                       "wrapperSha256": sha256(os.path.join(pkg, WRAPPER_NAME))}, f, indent=2)
+        return stage
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def install_native(stage, backup_dir):
+    target = native_dir()
+    if os.path.exists(target):
+        aside = os.path.join(backup_dir, "replaced-" + os.path.basename(target))
+        os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+        shutil.rmtree(aside, ignore_errors=True)
+        os.replace(target, aside)
+    os.replace(os.path.join(stage, "package"), target)
+    shutil.rmtree(stage, ignore_errors=True)
+
+
+def discover_loader():
+    found = [p for p in fssafe_roots() if (lambda t: LOADER_RE.search(t) or NATIVE_ID in t)(read(p))]
+    if not any("fs-safe" in p for p in found):
+        raise PatchError("fs-safe native loader anchor not found")
+    return found
+
+
+def loader_state(text):
+    count = len(LOADER_RE.findall(text))
+    if count > 1:
+        raise PatchError(f"native loader anchor occurs {count} times")
+    return "needed" if count == 1 else "applied"
+
+
+def patch_loader(text):
+    text = LOADER_RE.sub(LOADER_NEW, text, count=1)
+    if loader_state(text) != "applied" or NATIVE_ID not in text:
+        raise PatchError("native loader post-patch verification failed")
+    return text
+
+
+# ── /proc process identity (Android has Linux /proc but platform "android") ──
+PROC_RE = re.compile(r'(function getProcessStartTime\((\w+)\)\s*\{\s*if\s*\(!isValidPid\(\2\)\s*\|\|\s*)'
+                     r'process\.platform\s*!==\s*(["`])linux\3(\))')
+PROC_DONE_RE = re.compile(r'function getProcessStartTime\(\w+\)\s*\{\s*if\s*\(!isValidPid\(\w+\)\s*\|\|\s*'
+                          r'\(process\.platform !== "linux" && process\.platform !== "android"\)\)')
+
+
+def discover_proc():
+    found = [p for p in walk_dist() if (lambda t: PROC_RE.search(t) or PROC_DONE_RE.search(t))(read(p))]
+    if not found:
+        raise PatchError("getProcessStartTime /proc anchor not found")
+    return found
+
+
+def proc_state(text):
+    count = len(PROC_RE.findall(text))
+    if count > 1:
+        raise PatchError(f"getProcessStartTime anchor occurs {count} times")
+    return "needed" if count == 1 else "applied"
+
+
+def patch_proc(text):
+    text = PROC_RE.sub(r'\1(process.platform !== "linux" && process.platform !== "android")\4', text, count=1)
+    if proc_state(text) != "applied" or not PROC_DONE_RE.search(text):
+        raise PatchError("getProcessStartTime post-patch verification failed")
+    return text
+
+
+# ── session-migration archive move (link-required two-name publication) ─────
+MOVE_ID = "openclaw-patch-android:migration-move v1"
+MOVE_ANCHOR = ("async function moveMigrationArtifact(sourcePath, targetPath, expected, onPublished, publishSourceRemoval) {\n"
+               "\tlet createdPublication = false;\n")
+MOVE_HELPER = """/** __ID__: Android denies link(2), so archive by exclusive same-directory-tree rename. */
+async function _ocAndroidMoveMigrationArtifact(sourcePath, targetPath, expected, onPublished, publishSourceRemoval) {
+\tconst sourceStat = fs.lstatSync(sourcePath, { bigint: true, throwIfNoEntry: false });
+\tconst targetStat = fs.lstatSync(targetPath, { bigint: true, throwIfNoEntry: false });
+\tif (targetStat && sourceStat) throw new Error("artifact publication target already exists");
+\tlet moved = Boolean(targetStat);
+\tif (!moved && !sameMigrationArtifact(readMigrationArtifactIdentity(sourcePath), expected)) throw new Error("artifact changed before publication");
+\tconst removeSource = () => {
+\t\tif (!moved) {
+\t\t\tif (!sameMigrationArtifact(readMigrationArtifactIdentity(sourcePath), expected)) throw new Error("artifact changed before publication");
+\t\t\tif (fs.lstatSync(targetPath, { throwIfNoEntry: false })) throw new Error("artifact publication target already exists");
+\t\t\tfs.renameSync(sourcePath, targetPath);
+\t\t\tmoved = true;
+\t\t}
+\t\ttry {
+\t\t\tonPublished?.();
+\t\t} catch (error) {
+\t\t\tif (!fs.lstatSync(sourcePath, { throwIfNoEntry: false })) fs.renameSync(targetPath, sourcePath);
+\t\t\tmoved = false;
+\t\t\tthrow error;
+\t\t}
+\t};
+\tconst retainSource = () => {
+\t\tif (moved) throw new Error("Cannot discard a recovery publication created by an earlier run.");
+\t};
+\tif (publishSourceRemoval) publishSourceRemoval(removeSource, retainSource);
+\telse removeSource();
+\tif (!moved) return;
+\trequireDirectorySync(await syncDirectory(path.dirname(targetPath)), "Recovery artifact publication");
+\trequireDirectorySync(await syncDirectory(path.dirname(sourcePath)), "Recovery artifact source");
+\tif (!sameMigrationArtifact(readMigrationArtifactIdentity(targetPath), expected)) throw new Error("artifact changed during publication");
+}
+""".replace("__ID__", MOVE_ID)
+MOVE_REPLACEMENT = MOVE_HELPER + MOVE_ANCHOR + (
+    '\tif (process.platform === "android") return await _ocAndroidMoveMigrationArtifact(sourcePath, targetPath, expected, onPublished, publishSourceRemoval);\n')
+
+
+def discover_move():
+    return [p for p in walk_dist() if (lambda t: MOVE_ANCHOR in t or MOVE_ID in t)(read(p))]
+
+
+def move_state(text):
+    if MOVE_ID in text:
+        return "applied"
+    if text.count(MOVE_ANCHOR) != 1:
+        raise PatchError("moveMigrationArtifact anchor must occur exactly once")
+    for name in ("function sameMigrationArtifact(", "function readMigrationArtifactIdentity(", "requireDirectorySync(", "syncDirectory("):
+        if name not in text:
+            raise PatchError(f"moveMigrationArtifact helper {name} not in scope")
+    return "needed"
+
+
+def patch_move(text):
+    text = text.replace(MOVE_ANCHOR, MOVE_REPLACEMENT, 1)
+    if move_state(text) != "applied":
+        raise PatchError("moveMigrationArtifact post-patch verification failed")
+    return text
+
+
+# ── SQLite file identity birthtime (Android filesystems report none) ────────
+BIRTH_OLD = 'useDatabaseBirthtime = process.platform !== "linux";'
+BIRTH_NEW = 'useDatabaseBirthtime = process.platform !== "linux" && process.platform !== "android";'
+
+
+def discover_birth():
+    found = [p for p in walk_dist() if (lambda t: BIRTH_OLD in t or BIRTH_NEW in t)(read(p))]
+    if not found:
+        raise PatchError("useDatabaseBirthtime anchor not found")
+    return found
+
+
+def birth_state(text):
+    count = text.count(BIRTH_OLD)
+    if count > 1:
+        raise PatchError(f"useDatabaseBirthtime anchor occurs {count} times")
+    return "needed" if count == 1 else "applied"
+
+
+def patch_birth(text):
+    text = text.replace(BIRTH_OLD, BIRTH_NEW, 1)
+    if birth_state(text) != "applied":
+        raise PatchError("useDatabaseBirthtime post-patch verification failed")
+    return text
+
+
+# ── temp-root ownership (Android's /data and /data/data belong to system) ────
+OWNER_OLD = "if (stat.uid === 0 || stat.uid === 0n)"
+OWNER_NEW = ('if (stat.uid === 0 || stat.uid === 0n || process.platform === "android"'
+             ' && (stat.uid === 1000 || stat.uid === 1000n))')
+
+
+def discover_owner():
+    found = [p for p in fssafe_roots() if (lambda t: "function classifyTempWorkspaceOwner" in t
+                                            and (OWNER_OLD in t or OWNER_NEW in t))(read(p))]
+    if not found:
+        raise PatchError("classifyTempWorkspaceOwner anchor not found")
+    return found
+
+
+def owner_state(text):
+    count = text.count(OWNER_OLD)
+    if count > 1:
+        raise PatchError(f"temp owner anchor occurs {count} times")
+    return "needed" if count == 1 else "applied"
+
+
+def patch_owner(text):
+    text = text.replace(OWNER_OLD, OWNER_NEW, 1)
+    if owner_state(text) != "applied":
+        raise PatchError("temp owner post-patch verification failed")
+    return text
+
+
+# ── ancestor writability (Android app data dirs are 0771) ────────────────────
+# Group-write is safe when the group is the app's own per-user gid (sole member)
+# or the platform's system gid; world-write and private leaf dirs stay strict.
+ANDROID_GROUP_OK = ('(process.platform === "android" && (Number({s}.mode) & 2) === 0 && '
+                    '(Number({s}.gid) === process.getgid?.() || Number({s}.gid) === 1000))')
+ANCESTOR_EDITS = (
+    ("if (writable && (privateDirectory || !sticky))",
+     "if (writable && (privateDirectory || !sticky) && !(!privateDirectory && " + ANDROID_GROUP_OK.format(s="stat") + "))"),
+    ("const writableByOtherUsers = (currentIdentity.mode & 18) !== 0;",
+     "const writableByOtherUsers = (currentIdentity.mode & 18) !== 0 && !" + ANDROID_GROUP_OK.format(s="currentIdentity") + ";"),
+    ("const ownerCanReplaceChild = currentIdentity.uid !== uid && currentIdentity.uid !== 0;",
+     'const ownerCanReplaceChild = currentIdentity.uid !== uid && currentIdentity.uid !== 0'
+     ' && !(process.platform === "android" && currentIdentity.uid === 1000);'),
+)
+
+
+def discover_ancestor():
+    found = [p for p in fssafe_roots()
+             if (lambda t: any(old in t or new in t for old, new in ANCESTOR_EDITS))(read(p))]
+    if len(found) < 2:
+        raise PatchError("ancestor permission anchors not found")
+    return found
+
+
+def ancestor_state(text):
+    for old, _new in ANCESTOR_EDITS:
+        if text.count(old) > 1:
+            raise PatchError(f"ancestor anchor occurs more than once: {old[:40]}")
+    return "needed" if any(old in text for old, _ in ANCESTOR_EDITS) else "applied"
+
+
+def patch_ancestor(text):
+    for old, new in ANCESTOR_EDITS:
+        text = text.replace(old, new, 1)
+    if ancestor_state(text) != "applied":
+        raise PatchError("ancestor post-patch verification failed")
+    return text
+
+
+# ── CLI restart of a runit-supervised gateway ────────────────────────────────
+# The gateway records itself as a "foreground" owner under runit, and verifying
+# a foreground listener needs /proc/net (denied on Android); route through runit.
+LIFE_ID = "openclaw-patch-android:runit-restart v1"
+LIFE_OLD = 'if (!owner || owner.state === "dead" || owner.mode !== "foreground") return null;'
+LIFE_NEW = ('if (!owner || owner.state === "dead" || owner.mode !== "foreground" || process.platform === "android"'
+            ' && await service.isLoaded({ env: process.env }).catch(() => false)) return null; /* ' + LIFE_ID + ' */')
+# A cold gateway start takes ~70s on a phone; give Android the Windows 180s health window.
+LIFE_WAIT_OLD = 'return process.platform === "win32" ? Math.ceil(WINDOWS_POST_RESTART_HEALTH_TIMEOUT_MS / 500) : DEFAULT_RESTART_HEALTH_ATTEMPTS;'
+LIFE_WAIT_NEW = ('return process.platform === "win32" || process.platform === "android"'
+                 ' ? Math.ceil(WINDOWS_POST_RESTART_HEALTH_TIMEOUT_MS / 500) : DEFAULT_RESTART_HEALTH_ATTEMPTS;')
+
+
+def discover_life():
+    found = [p for p in walk_dist() if (lambda t: (LIFE_OLD in t or LIFE_ID in t) and "restartOwnedProcess" in t)(read(p))]
+    if len(found) != 1:
+        raise PatchError(f"expected one gateway restart owner check, found {len(found)}")
+    return found
+
+
+def life_state(text):
+    if LIFE_ID in text and LIFE_WAIT_OLD not in text:
+        return "applied"
+    if LIFE_WAIT_OLD in text and text.count(LIFE_WAIT_OLD) != 1:
+        raise PatchError("restart health window anchor occurs more than once")
+    if LIFE_ID in text:
+        return "needed"
+    if text.count(LIFE_OLD) != 1 or "const service = resolveGatewayService();" not in text:
+        raise PatchError("gateway restart owner check anchor not unique or service not in scope")
+    return "needed"
+
+
+def patch_life(text):
+    text = text.replace(LIFE_OLD, LIFE_NEW, 1)
+    text = text.replace(LIFE_WAIT_OLD, LIFE_WAIT_NEW, 1)
+    if life_state(text) != "applied":
+        raise PatchError("gateway restart post-patch verification failed")
+    return text
+
+
+def unique(kind, candidates):
+    if len(candidates) != 1:
+        listing = "\n  ".join(candidates) or "(none)"
+        raise PatchError(f"expected exactly one {kind} file, found {len(candidates)}:\n  {listing}")
+    return candidates[0]
+
+
+# ── JS scanning helpers ──────────────────────────────────────────────────────
+def matching_brace(text, open_idx):
+    """Index of the brace closing text[open_idx]; skips strings and comments."""
+    assert text[open_idx] == "{"
+    depth, i, n = 0, open_idx, len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'`":
+            q, i = c, i + 1
+            while i < n and text[i] != q:
+                i += 2 if text[i] == "\\" else 1
+        elif text.startswith("//", i):
+            i = text.find("\n", i)
+            if i < 0:
+                break
+        elif text.startswith("/*", i):
+            i = text.find("*/", i) + 1
+            if i <= 0:
+                break
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    raise PatchError("unbalanced braces after GATEWAY_SERVICE_REGISTRY")
+
+
+def registry_span(text):
+    if text.count(REGISTRY_DECL) != 1:
+        raise PatchError(f"'{REGISTRY_DECL}' must occur exactly once (found {text.count(REGISTRY_DECL)})")
+    start = text.index(REGISTRY_DECL) + len(REGISTRY_DECL) - 1
+    return start, matching_brace(text, start)
+
+
+def top_level_keys(body):
+    """Keys of the registry object (tab-indented once in the bundle)."""
+    return re.findall(r"^\t([A-Za-z0-9_$]+): \{", body, re.M)
+
+
+# ── runit adapter source ─────────────────────────────────────────────────────
+RUNIT_CODE = r"""
+//#region openclaw-patch-android (__PATCH_ID__)
+/** Termux/runit gateway service adapter. Preserves a customized existing service. */
+const _OC_ANDROID_SV_NAME = "openclaw-gateway";
+const _OC_ANDROID_PREFIX = process.env.PREFIX || "/data/data/com.termux/files/usr";
+const _OC_ANDROID_HOME = _OC_ANDROID_PREFIX.replace(/\/usr\/?$/, "") + "/home";
+const _OC_ANDROID_FS = __FS__;
+const _OC_ANDROID_SERVICE_DIRS = [
+	_OC_ANDROID_PREFIX + "/var/service/" + _OC_ANDROID_SV_NAME,
+	_OC_ANDROID_PREFIX + "/etc/sv/" + _OC_ANDROID_SV_NAME
+];
+const _OC_ANDROID_RUN_SCRIPT = [
+	"#!" + _OC_ANDROID_PREFIX + "/bin/sh",
+	"case \"$0\" in",
+	"  */run) ;;",
+	"  *) echo \"Error: this script must be executed, not sourced\" >&2; return 1 2>/dev/null; exit 1 ;;",
+	"esac",
+	"",
+	"set -e",
+	"export HOME=\"${PREFIX%/usr}/home\"",
+	"[ -f ~/.openclaw/gateway-env.sh ] && . ~/.openclaw/gateway-env.sh",
+	"export LD_PRELOAD=libtermux-exec.so",
+	"exec openclaw gateway run 2>&1",
+	""
+].join("\n");
+const _OC_ANDROID_LOG_RUN_SCRIPT = "#!" + _OC_ANDROID_PREFIX + "/bin/sh\nexec svlogd -tt \"" + _OC_ANDROID_PREFIX + "/var/log/sv/" + _OC_ANDROID_SV_NAME + "\"\n";
+function _ocAndroidServiceDir() {
+	for (const dir of _OC_ANDROID_SERVICE_DIRS) if (_OC_ANDROID_FS.existsSync(dir + "/run")) return dir;
+	return null;
+}
+function _ocAndroidSv(args, timeoutMs) {
+	const dir = _ocAndroidServiceDir();
+	if (!dir) return { dir: null, code: null, stdout: "", stderr: "service directory not found" };
+	const result = _ocAndroidSpawnSync("sv", [...args, dir], {
+		encoding: "utf8",
+		timeout: timeoutMs ?? 9e4,
+		env: { ...process.env, SVDIR: _OC_ANDROID_PREFIX + "/var/service" }
+	});
+	if (result.error) throw result.error;
+	return { dir, code: result.status, stdout: result.stdout || "", stderr: result.stderr || "" };
+}
+function _ocAndroidSvMutate(args, verb) {
+	const result = _ocAndroidSv(args);
+	if (!result.dir) throw new Error("runit service " + _OC_ANDROID_SV_NAME + " not found under " + _OC_ANDROID_SERVICE_DIRS.join(" or "));
+	if (result.code !== 0) throw new Error("sv " + verb + " " + _OC_ANDROID_SV_NAME + " failed (exit " + result.code + "): " + (result.stdout + result.stderr).trim());
+	return result;
+}
+function _ocAndroidValidateService(dir) {
+	const run = _OC_ANDROID_FS.readFileSync(dir + "/run", "utf8");
+	_OC_ANDROID_FS.accessSync(dir + "/run", _OC_ANDROID_FS.constants.X_OK);
+	if (!/^\s*exec\s+\S*openclaw\s+gateway\s+run\b/m.test(run)) throw new Error("existing runit service " + dir + "/run does not exec `openclaw gateway run`; refusing to modify it");
+	return run;
+}
+async function _ocAndroidStageService({ stdout } = {}) {
+	const existing = _ocAndroidServiceDir();
+	if (existing) {
+		_ocAndroidValidateService(existing);
+		stdout?.write?.("Preserving existing runit service at " + existing + ".\n");
+		return { dir: existing, created: false };
+	}
+	const dir = _OC_ANDROID_SERVICE_DIRS[0];
+	if (_OC_ANDROID_FS.existsSync(dir)) throw new Error(dir + " exists without an executable run script; refusing to overwrite it");
+	_OC_ANDROID_FS.mkdirSync(dir + "/log", { recursive: true, mode: 0o700 });
+	_OC_ANDROID_FS.mkdirSync(_OC_ANDROID_PREFIX + "/var/log/sv/" + _OC_ANDROID_SV_NAME, { recursive: true, mode: 0o700 });
+	_OC_ANDROID_FS.writeFileSync(dir + "/log/run", _OC_ANDROID_LOG_RUN_SCRIPT, { mode: 0o700, flag: "wx" });
+	_OC_ANDROID_FS.writeFileSync(dir + "/run", _OC_ANDROID_RUN_SCRIPT, { mode: 0o700, flag: "wx" });
+	stdout?.write?.("Created runit service at " + dir + ".\n");
+	return { dir, created: true };
+}
+async function _ocAndroidInstallService(args = {}) {
+	const staged = await _ocAndroidStageService(args);
+	if (!staged.created) return;
+	for (let i = 0; i < 20 && !_OC_ANDROID_FS.existsSync(staged.dir + "/supervise/ok"); i++) await new Promise((resolve) => setTimeout(resolve, 500));
+	_ocAndroidSvMutate(["up"], "up");
+	args.stdout?.write?.("Runit service started.\n");
+}
+async function _ocAndroidUninstallService({ stdout } = {}) {
+	const dir = _ocAndroidServiceDir();
+	if (!dir) return;
+	try { _ocAndroidSv(["-w", "60", "down"]); } catch {}
+	const parked = _OC_ANDROID_HOME + "/.cache/openclaw-patch-android/removed-services/" + _OC_ANDROID_SV_NAME + "." + new Date().toISOString().replace(/[:.]/g, "-");
+	_OC_ANDROID_FS.mkdirSync(parked.slice(0, parked.lastIndexOf("/")), { recursive: true, mode: 0o700 });
+	_OC_ANDROID_FS.renameSync(dir, parked);
+	stdout?.write?.("Runit service stopped and moved to " + parked + ".\n");
+}
+async function _ocAndroidStartService() { _ocAndroidSvMutate(["-w", "60", "up"], "up"); }
+async function _ocAndroidStopService() { _ocAndroidSvMutate(["-w", "60", "down"], "down"); }
+async function _ocAndroidRestartService() {
+	_ocAndroidSvMutate(["-w", "60", "restart"], "restart");
+	return { outcome: "completed" };
+}
+async function _ocAndroidIsServiceLoaded() {
+	try {
+		const { dir, code, stdout } = _ocAndroidSv(["status"], 15e3);
+		return Boolean(dir) && code === 0 && /^(run|down|finish): /.test(stdout);
+	} catch { return false; }
+}
+function _ocAndroidSplitWords(line) {
+	const words = [];
+	const re = /"((?:[^"\\]|\\.)*)"|'([^']*)'|(\S+)/g;
+	let m;
+	while ((m = re.exec(line)) !== null) words.push(m[1] !== void 0 ? m[1].replace(/\\(.)/g, "$1") : m[2] !== void 0 ? m[2] : m[3]);
+	return words;
+}
+async function _ocAndroidReadServiceCommand() {
+	const dir = _ocAndroidServiceDir();
+	if (!dir) return null;
+	let run;
+	try { run = _OC_ANDROID_FS.readFileSync(dir + "/run", "utf8"); } catch { return null; }
+	const execLine = run.split("\n").map((line) => line.trim()).filter((line) => /^exec\s/.test(line)).pop();
+	if (!execLine) return null;
+	const words = _ocAndroidSplitWords(execLine.replace(/^exec\s+/, "")).filter((word) => !/^\d?>&\d$|^2>&1$/.test(word));
+	if (words.length === 0) return null;
+	if (!words[0].includes("/")) {
+		const candidate = _OC_ANDROID_PREFIX + "/bin/" + words[0];
+		if (_OC_ANDROID_FS.existsSync(candidate)) words[0] = candidate;
+	}
+	return {
+		programArguments: words,
+		workingDirectory: _OC_ANDROID_HOME,
+		sourcePath: dir + "/run"
+	};
+}
+async function _ocAndroidReadServiceRuntime() {
+	try {
+		const { dir, code, stdout, stderr } = _ocAndroidSv(["status"], 15e3);
+		if (!dir) return { status: "stopped", missingUnit: true };
+		const head = stdout.split(";")[0];
+		let m = head.match(/^run: [^:]+: \(pid (\d+)\) (\d+)s/);
+		if (m) return { status: "running", state: "running", pid: Number(m[1]), uptimeSeconds: Number(m[2]) };
+		m = head.match(/^(down|finish): [^:]+: (\d+)s/);
+		if (m) return { status: "stopped", state: m[1], downSeconds: Number(m[2]) };
+		return { status: "unknown", detail: (stdout + stderr).trim() || ("sv status exit " + code) };
+	} catch (error) {
+		return { status: "unknown", detail: String(error) };
+	}
+}
+//#endregion
+"""
+
+ANDROID_ENTRY = """\tandroid: {
+\t\tlabel: "runit/sv",
+\t\tloadedText: "supervised",
+\t\tnotLoadedText: "not supervised",
+\t\tstage: ignoreServiceWriteResult(_ocAndroidStageService),
+\t\tinstall: ignoreServiceWriteResult(_ocAndroidInstallService),
+\t\tuninstall: _ocAndroidUninstallService,
+\t\tstart: _ocAndroidStartService,
+\t\tstop: _ocAndroidStopService,
+\t\trestart: _ocAndroidRestartService,
+\t\tisLoaded: _ocAndroidIsServiceLoaded,
+\t\tisEnabled: _ocAndroidIsServiceLoaded,
+\t\treadCommand: _ocAndroidReadServiceCommand,
+\t\treadRuntime: _ocAndroidReadServiceRuntime
+\t}"""
+
+
+# ── patch logic ──────────────────────────────────────────────────────────────
+def service_state(text):
+    _, end = registry_span(text)
+    keys = top_level_keys(text[text.index(REGISTRY_DECL):end])
+    has_marker = PATCH_ID in text
+    android = keys.count("android")
+    if has_marker and android == 1:
+        return "applied"
+    if has_marker or android:
+        raise PatchError(f"partial or foreign android patch (marker={has_marker}, android entries={android})")
+    if any(m in text for m in LEGACY_MARKERS):
+        raise PatchError("legacy v1 patch present; reinstall the package before patching")
+    return "needed"
+
+
+def patch_service(text):
+    if "ignoreServiceWriteResult(" not in text:
+        raise PatchError("ignoreServiceWriteResult helper not found")
+    if text.count(SERVICE_REGION) != 1:
+        raise PatchError("'//#region src/daemon/service.ts' must occur exactly once")
+    # Imports: reuse the default fs import, add a collision-resistant spawnSync alias.
+    fs_imports = len(FS_IMPORT_RE.findall(text))
+    fs_name = "fs" if fs_imports == 1 else "_ocAndroidFs"
+    header = ""
+    if fs_name != "fs":
+        header += 'import _ocAndroidFs from "node:fs";\n'
+    if "_ocAndroidSpawnSync" not in text:
+        header += SPAWN_IMPORT
+    first_region = text.find("\n//#region")
+    if first_region < 0:
+        raise PatchError("no //#region marker after the import block")
+    text = text[: first_region + 1] + header + text[first_region + 1 :]
+    # Adapter code goes right after the registry's own helpers, before the registry.
+    code = RUNIT_CODE.replace("__PATCH_ID__", PATCH_ID).replace("__FS__", fs_name)
+    decl = text.index(REGISTRY_DECL)
+    text = text[:decl] + code.lstrip("\n") + text[decl:]
+    # Registry entry: append after the last platform entry, before the closing brace.
+    start, end = registry_span(text)
+    body_end = len(text[:end].rstrip())
+    if text[body_end - 1] != "}":
+        raise PatchError("registry does not end with a platform entry")
+    text = text[:body_end] + ",\n" + ANDROID_ENTRY + "\n" + text[end:]
+    if service_state(text) != "applied":
+        raise PatchError("post-patch verification failed")
+    return text
+
+
+def dash_state(text):
+    if DASH_DETECT.search(text):
+        return "applied"
+    count = text.count(DASH_ANCHOR)
+    if count != 1:
+        raise PatchError(f"'{DASH_ANCHOR}' must occur exactly once (found {count})")
+    return "needed"
+
+
+def patch_dash(text):
+    idx = text.index(DASH_ANCHOR)
+    line_start = text.rfind("\n", 0, idx) + 1
+    indent = text[line_start:idx]
+    if indent.strip():
+        raise PatchError("dashboard anchor is not at the start of a line")
+    text = text[:line_start] + indent + DASH_LINE + "\n" + text[line_start:]
+    if dash_state(text) != "applied" or text.count(DASH_ANCHOR) != 1:
+        raise PatchError("dashboard post-patch verification failed")
+    return text
+
+
+def package_version():
+    try:
+        with open(os.path.join(os.path.dirname(dist), "package.json"), encoding="utf-8") as f:
+            return json.load(f).get("version", "unknown")
+    except (OSError, ValueError):
+        return "unknown"
+
+
+def backup(path, backup_dir):
+    os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+    dest = os.path.join(backup_dir, os.path.relpath(path, os.path.dirname(dist)).replace(os.sep, "__"))
+    if not os.path.exists(dest):
+        shutil.copy2(path, dest)
+    return dest
+
+
+def atomic_write(path, text):
+    base, ext = os.path.splitext(path)
+    tmp = f"{os.path.dirname(path)}/.{os.path.basename(base)}.ocpatch-tmp{ext}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    shutil.copymode(path, tmp)
+    check = subprocess.run(["node", "--check", tmp], capture_output=True, text=True)
+    if check.returncode != 0:
+        os.unlink(tmp)
+        raise PatchError(f"node --check failed for patched {os.path.basename(path)}:\n{check.stderr.strip()}")
+    os.replace(tmp, path)
+
+
+def main():
+    try:
+        svc_candidates, dash_candidates = discover()
+        svc_file = unique("service registry", svc_candidates)
+        dash_file = unique("dashboard", dash_candidates)
+        # (patch name, file, current text, state, patch function)
+        plan = [
+            ("service", svc_file, read(svc_file), None, patch_service),
+            ("dashboard", dash_file, read(dash_file), None, patch_dash),
+        ]
+        plan += [("fs-safe", p, read(p), None, patch_fssafe) for p in discover_fssafe()]
+        plan += [("loader", p, read(p), None, patch_loader) for p in discover_loader()]
+        plan += [("proc", p, read(p), None, patch_proc) for p in discover_proc()]
+        plan += [("migrate", p, read(p), None, patch_move) for p in discover_move()]
+        plan += [("birth", p, read(p), None, patch_birth) for p in discover_birth()]
+        plan += [("owner", p, read(p), None, patch_owner) for p in discover_owner()]
+        plan += [("ancestor", p, read(p), None, patch_ancestor) for p in discover_ancestor()]
+        plan += [("lifecycle", p, read(p), None, patch_life) for p in discover_life()]
+        states = {"service": service_state, "dashboard": dash_state, "fs-safe": fssafe_state,
+                  "loader": loader_state, "proc": proc_state, "migrate": move_state,
+                  "birth": birth_state, "owner": owner_state, "ancestor": ancestor_state,
+                  "lifecycle": life_state}
+        plan = [(n, p, t, states[n](t), f) for n, p, t, _, f in plan]
+        addon = native_state()
+    except PatchError as ex:
+        fail(str(ex))
+
+    for name, path, _, state, _ in plan:
+        print(f"{name:9} {state:7} {os.path.relpath(path, dist)}")
+    print(f"{'native':9} {addon:7} {os.path.relpath(native_dir(), dist)}")
+    needed = [(n, p, t, f) for n, p, t, s, f in plan if s == "needed"]
+
+    if check_only:
+        names = sorted({n for n, *_ in needed} | ({"native"} if addon == "needed" else set()))
+        print("Patch status: " + ("applied" if not names else "needed: " + ", ".join(names)))
+        sys.exit(1 if names else 0)
+    if not needed and addon == "applied":
+        print("All Android patches already applied. Nothing to do.")
+        return
+
+    # Compute every patched text (and build the addon) before writing anything.
+    try:
+        updates = {}
+        for _, path, text, fn in needed:  # several patches may touch one file
+            updates[path] = fn(updates.get(path, text))
+        stage = build_native() if addon == "needed" else None
+    except PatchError as ex:
+        fail(str(ex))
+
+    backup_dir = backup_dir_arg or os.path.join(
+        os.path.expanduser("~"), ".cache", "openclaw-patch-android", "backups", package_version())
+    try:
+        if stage:
+            install_native(stage, backup_dir)
+            print(f"installed {os.path.relpath(native_dir(), dist)}  (relinked musl prebuild + Bionic shim)")
+        for path, text in updates.items():
+            saved = backup(path, backup_dir)
+            atomic_write(path, text)
+            print(f"patched   {os.path.relpath(path, dist)}  (original: {saved})")
+    except (PatchError, OSError) as ex:
+        fail(str(ex))
+    print("Patched OK.")
+
+
+main()
+PYEOF

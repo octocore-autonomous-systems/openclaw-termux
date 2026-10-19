@@ -4,9 +4,10 @@ A safe update and maintenance manager for [OpenClaw](https://openclaw.ai)
 ([GitHub](https://github.com/openclaw/openclaw)) running natively on Android under
 [Termux](https://termux.dev) ([GitHub](https://github.com/termux/termux-app)).
 
-> **Status: early development.** This repository is being bootstrapped. The `install.sh` script and
-> the `openclaw-termux` commands described below are the **planned v1 interface** and are not
-> implemented yet. Until the first release, treat this README as the design contract.
+> **Status: early development (milestone M1 of 4).** The repository holds the Android patch set,
+> the CLI skeleton, the test harness and the [design](docs/design.md). The `install.sh` script and
+> the `openclaw-termux` commands described below are the **planned v1 interface**. They are not
+> implemented yet and currently exit with "not implemented yet".
 
 ## Introduction
 
@@ -82,6 +83,22 @@ openclaw-termux status    # confirm the new version is healthy
 
 Each command writes a log to `~/.local/state/openclaw-termux/logs/`, with secrets redacted.
 
+### The Android patch set
+
+[`patch/openclaw-patch-android`](patch/openclaw-patch-android) applies the Android patches to an
+OpenClaw `dist/` tree. It knows 11 patch types: service, dashboard, fs-safe, native, loader, proc,
+migrate, birth, owner, ancestor and lifecycle. It is content-addressed, idempotent and fail-closed:
+a missing or duplicated code anchor aborts before anything is written. The manager runs it only
+against staged trees, and only if its hash matches the pinned value:
+
+```text
+sha256  47522583f17ec9472a9065bb7874c03193e97699f94b120b7675a27821661661  patch/openclaw-patch-android
+```
+
+Changing the patch set means changing that file, this hash and `PATCHER_SHA256` in
+[`lib/openclaw_termux/patcher.py`](lib/openclaw_termux/patcher.py) in one pull request. A test
+fails otherwise.
+
 ## Contributing
 
 Contributions are welcome. Please:
@@ -90,7 +107,17 @@ Contributions are welcome. Please:
    OpenClaw versions, plus `openclaw-termux status` output with secrets removed.
 2. **Work on a branch and open a pull request into `main`.** Nobody pushes directly to `main`.
 3. **Keep CI green.** Every pull request must pass the checks in
-   [`.github/workflows/ci.yml`](.github/workflows/ci.yml) before it is merged.
+   [`.github/workflows/ci.yml`](.github/workflows/ci.yml) before it is merged. Run the tests locally
+   first. They use only the Python standard library, Node.js and Bash:
+
+   ```sh
+   python3 -m unittest discover -s tests -t .
+   OPENCLAW_TERMUX_RELEASE=2026.10.4 python3 -m unittest tests.test_release   # needs npm and network
+   OPENCLAW_TERMUX_RELEASE=2026.10.4 OPENCLAW_TERMUX_ANDROID_APPLY=1 \
+     python3 -m unittest tests.test_android_apply                             # Termux only
+   shellcheck bin/openclaw-termux patch/openclaw-patch-android
+   ```
+
 4. **Keep changes focused,** with a clear description of what changed and why. Changes to the
    Android patch set need a test against a real OpenClaw release.
 5. **Never commit secrets,** tokens, API keys or personal OpenClaw config. CI runs a secret scan on
