@@ -38,6 +38,34 @@ jobs:
         with:
           globs: "**/*.md"
 
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: shellcheck --version && shellcheck bin/openclaw-termux patch/openclaw-patch-android
+
+  tests:
+    name: Unit and fake-prefix tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 --version && node --version
+      - run: python3 -m unittest discover -s tests -t . -v
+
+  release-check:
+    name: Patch check against OpenClaw ${{ matrix.release }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        release: ["2026.10.4"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 -m unittest -v tests.test_release
+        env:
+          OPENCLAW_TERMUX_RELEASE: ${{ matrix.release }}
+          OPENCLAW_TERMUX_RELEASE_CACHE: ${{ runner.temp }}/openclaw-releases
+
   license:
     name: LICENSE is the exact MPL-2.0 text
     runs-on: ubuntu-latest
